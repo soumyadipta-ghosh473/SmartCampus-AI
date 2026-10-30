@@ -108,18 +108,21 @@ class CampusMultiTaskDistilBERT(nn.Module):
 @st.cache_resource
 def load_model():
     tokenizer = PreTrainedTokenizerFast(
-        tokenizer_file=os.path.join(MODEL_DIR, "tokenizer.json")
+        tokenizer_file=os.path.join(MODEL_DIR, "tokenizer.json"),
+        pad_token="[PAD]",
     )
 
-    # The saved tokenizer.json may not persist the padding-token setting.
-    # DistilBERT's standard vocabulary already contains [PAD] (token ID 0),
-    # so configure it here without adding a new embedding to the trained model.
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.convert_ids_to_tokens(0)
+    # Explicitly register the existing DistilBERT padding token. This is
+    # important because tokenizer.json alone may omit special-token metadata.
+    if tokenizer.pad_token_id is None:
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
-    if tokenizer.pad_token is None:
+    # The pretrained DistilBERT vocabulary uses [PAD] at ID 0. Do not add
+    # a new embedding or resize the trained model's embedding matrix.
+    if tokenizer.pad_token_id != 0:
         raise ValueError(
-            "Tokenizer has no padding token. Expected the DistilBERT [PAD] token."
+            f"Expected DistilBERT [PAD] token ID 0, got {tokenizer.pad_token_id}. "
+            "Check the saved tokenizer.json before running SHAP."
         )
 
     model = CampusMultiTaskDistilBERT(
@@ -227,6 +230,7 @@ def predict_probabilities_for_shap(texts):
 @st.cache_resource
 def load_shap_explainer():
     # DistilBERT uses [MASK] as its token replacement baseline.
+    # Pass the tokenizer with an explicit, registered pad token to SHAP.
     masker = shap.maskers.Text(tokenizer, mask_token="[MASK]")
 
     output_names = (
