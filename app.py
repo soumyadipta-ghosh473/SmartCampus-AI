@@ -111,6 +111,17 @@ def load_model():
         tokenizer_file=os.path.join(MODEL_DIR, "tokenizer.json")
     )
 
+    # The saved tokenizer.json may not persist the padding-token setting.
+    # DistilBERT's standard vocabulary already contains [PAD] (token ID 0),
+    # so configure it here without adding a new embedding to the trained model.
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.convert_ids_to_tokens(0)
+
+    if tokenizer.pad_token is None:
+        raise ValueError(
+            "Tokenizer has no padding token. Expected the DistilBERT [PAD] token."
+        )
+
     model = CampusMultiTaskDistilBERT(
         MODEL_NAME,
         len(type_labels),
