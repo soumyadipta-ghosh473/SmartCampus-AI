@@ -1,8 +1,11 @@
-﻿
+
 import os
 from datetime import datetime
 
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
+import shap
 import torch
 import torch.nn as nn
 import streamlit as st
@@ -169,6 +172,67 @@ def predict_complaint(text):
 
 
 # ---------------------------------------------------------
+# SHAP explainability for the three DistilBERT output heads
+# ---------------------------------------------------------
+
+def predict_probabilities_for_shap(texts):
+    """
+    SHAP calls this function with batches of masked complaint texts.
+    Return all three heads' probabilities in one matrix so the encoder
+    is evaluated once per SHAP batch.
+    """
+    if isinstance(texts, str):
+        texts = [texts]
+
+    texts = [str(text) for text in texts]
+
+    inputs = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=256,
+        return_tensors="pt",
+    )
+    inputs = {key: value.to(device) for key, value in inputs.items()}
+
+    model.eval()
+    with torch.inference_mode():
+        type_logits, department_logits, priority_logits = model(**inputs)
+
+        type_probs = torch.softmax(type_logits, dim=-1)
+        department_probs = torch.softmax(department_logits, dim=-1)
+        priority_probs = torch.softmax(priority_logits, dim=-1)
+
+    return np.concatenate(
+        [
+            type_probs.cpu().numpy(),
+            department_probs.cpu().numpy(),
+            priority_probs.cpu().numpy(),
+        ],
+        axis=1,
+    )
+
+
+@st.cache_resource
+def load_shap_explainer():
+    # DistilBERT uses [MASK] as its token replacement baseline.
+    masker = shap.maskers.Text(tokenizer, mask_token="[MASK]")
+
+    output_names = (
+        [f"Ticket Type: {label}" for label in type_labels]
+        + [f"Department: {label}" for label in department_labels]
+        + [f"Priority: {label}" for label in priority_labels]
+    )
+
+    return shap.Explainer(
+        predict_probabilities_for_shap,
+        masker,
+        algorithm="partition",
+        output_names=output_names,
+    )
+
+
+# ---------------------------------------------------------
 # Ticket storage
 # ---------------------------------------------------------
 
@@ -234,6 +298,12 @@ if "analyzed_complaint" not in st.session_state:
 if "ticket_created_for" not in st.session_state:
     st.session_state.ticket_created_for = None
 
+if "shap_values" not in st.session_state:
+    st.session_state.shap_values = None
+
+if "shap_complaint" not in st.session_state:
+    st.session_state.shap_complaint = None
+
 tab1, tab2 = st.tabs(["Student Complaint Portal", "Admin Dashboard"])
 
 # ---------------------------------------------------------
@@ -262,6 +332,8 @@ with tab1:
                     st.session_state.prediction = predict_complaint(complaint.strip())
                     st.session_state.analyzed_complaint = complaint.strip()
                     st.session_state.ticket_created_for = None
+                    st.session_state.shap_values = None
+                    st.session_state.shap_complaint = None
             except Exception as exc:
                 st.error(f"Complaint analysis failed: {exc}")
 
@@ -294,6 +366,95 @@ with tab1:
             "Confidence is the model's estimated probability for its selected "
             "label; it is not a guarantee of correctness."
         )
+
+        # -------------------------------------------------
+        # SHAP explanation panel
+        # -------------------------------------------------
+        st.divider()
+        st.subheader("Explainable AI — Why did the model make this prediction?")
+        st.write(
+            "Generate word-level SHAP explanations for the selected "
+            "ticket type, department, and priority predictions."
+        )
+
+        if st.button("Generate SHAP Explanations", key="generate_shap"):
+            try:
+                with st.spinner(
+                    "Calculating SHAP values for the three model outputs. "
+                    "This may take a little while..."
+                ):
+                    explainer = load_shap_explainer()
+
+                    # The explanation uses the same 256-token input limit as prediction.
+                    token_count = len(
+                        tokenizer(
+                            analyzed_complaint,
+                            truncation=True,
+                            max_length=256,
+                            add_special_tokens=False,
+                        )["input_ids"]
+                    )
+                    max_evals = max(2 * token_count + 1, 3)
+
+                    st.session_state.shap_values = explainer(
+                        [analyzed_complaint],
+                        max_evals=max_evals,
+                    )
+                    st.session_state.shap_complaint = analyzed_complaint
+
+            except Exception as exc:
+                st.session_state.shap_values = None
+                st.session_state.shap_complaint = None
+                st.error(f"SHAP explanation could not be generated: {exc}")
+
+        shap_values = st.session_state.shap_values
+        if shap_values is not None and st.session_state.shap_complaint == analyzed_complaint:
+            st.caption(
+                "Positive bars support the selected class; negative bars "
+                "push the model away from that class. SHAP describes model "
+                "behaviour and does not establish causation."
+            )
+
+            tasks = [
+                (
+                    "Ticket Type",
+                    type_labels,
+                    "Type Confidence",
+                    0,
+                ),
+                (
+                    "Department",
+                    department_labels,
+                    "Department Confidence",
+                    len(type_labels),
+                ),
+                (
+                    "Priority",
+                    priority_labels,
+                    "Priority Confidence",
+                    len(type_labels) + len(department_labels),
+                ),
+            ]
+
+            for task_name, labels, confidence_key, output_offset in tasks:
+                predicted_label = prediction[task_name]
+                predicted_id = labels.index(predicted_label)
+                output_index = output_offset + predicted_id
+
+                st.markdown(f"**{task_name}: {predicted_label}**")
+                selected_explanation = shap_values[0, :, output_index]
+
+                fig, ax = plt.subplots(figsize=(10, 4))
+                plt.sca(ax)
+                shap.plots.bar(
+                    selected_explanation,
+                    max_display=12,
+                    show=False,
+                )
+                ax.set_title(f"Word contributions — {task_name}")
+                fig.tight_layout()
+                st.pyplot(fig, clear_figure=True)
+                plt.close(fig)
 
         if st.session_state.ticket_created_for == analyzed_complaint:
             st.success("This complaint has already been saved as a support ticket.")
