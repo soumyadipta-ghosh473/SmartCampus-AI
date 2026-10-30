@@ -4,3 +4,5 @@ transformers
 safetensors
 pandas
 numpy
+shap
+matplotlib
